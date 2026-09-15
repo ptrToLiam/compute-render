@@ -1,0 +1,5 @@
+.ark/
+.ark_config
+.ark_ignore
+
+bin/
