@@ -28,9 +28,15 @@
 #define RENDER_WIDTH  (1920 / 2)
 #define RENDER_HEIGHT (1080 / 2)
 
+#define COMPUTE_KERNELS(X) \
+  X(0, k_clear) \
+  X(1, k_sdf_2d) \
+  X(2, k_sdf_3d)
+
 #endif /* APU DEF_ */
 
 #if GPU_
+
 
 #define F1 float
 #define F2 vec2
@@ -46,12 +52,13 @@
 #define S3 ivec3
 #define S4 ivec4
 
+#define KERNEL_DISPATCH(id, fn) if (K == id) fn();
+
 layout(constant_id = 0) const I1 K = 0;
 layout(constant_id = 1) const I1 W = RENDER_WIDTH;
 layout(constant_id = 2) const I1 H = RENDER_HEIGHT;
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(set = 0, binding = 0, rgba8) uniform writeonly image2D out_image;
-
 
 //-----------------------------------------------------------------------------
 // Analytic SDF Function Definitions
@@ -67,22 +74,29 @@ struct Box {
   F3 size;
 };
 
-F1 fCircle(F2 p, F1 r)
+F1 fSphere(F3 p, F3 c, F1 r)
 {
-  return length(p) - r;
-}
-
-F1 fSphere(F3 p, F3 c, F1 r) {
   return length(p - c) - r;
 }
 
-F1 fBox(F3 p, F3 c, F3 size) {
+F1 fSegment(F2 p, F2 a, F2 b)
+{
+  F2 pa = p - a, ba = b - a;
+  F1 h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+  return length(pa - ba * h);
+}
+
+F1 fRing(F2 p, F2 c, F1 r) { return abs(length(p - c) - r); }
+
+F1 fBox(F3 p, F3 c, F3 size)
+{
   F3 q = abs(p - c) - size;
   return length(max(q, 0.0)) + min(max(q.x, max(q.y,q.z)), 0.0);
 }
 
-I1 marchMaxSteps = 128;
-F1 fScene(F3 p) {
+const I1 marchMaxSteps = 128;
+F1 fScene(F3 p)
+{
   Sphere sphere = { F3(0), 1.0 };
   Box    box    = { F3(-0.2), F3(0.4) };
 
@@ -92,7 +106,8 @@ F1 fScene(F3 p) {
   return min(fd, d);
 }
 
-F1 fScene2d(F2 p) {
+F1 fScene2d(F2 p)
+{
   F1 r = 0.3;
   F3 c = F3(0, 0.5, 0.0);
 
@@ -109,7 +124,8 @@ F1 fScene2d(F2 p) {
 //-----------------------------------------------------------------------------
 
 const I1 kMaxIter = 128;
-I1 mandelbrot(inout F2 z) {
+I1 mandelbrot(inout F2 z)
+{
   const F2 c = z;
   for (I1 i = 0; i < kMaxIter; i++) {
     if (dot(z,z) > 256) return i;
@@ -118,7 +134,8 @@ I1 mandelbrot(inout F2 z) {
   return kMaxIter;
 }
 
-F3 mandelbrot_color(F2 uv) {
+F3 mandelbrot_color(F2 uv)
+{
   I1 i = mandelbrot(uv);
   F3 color = F3(0.0);
   if (i != kMaxIter) {
@@ -172,6 +189,28 @@ void k_sdf_2d()
   col *= 0.8 + 0.2 * cos(140.0 * d); // isolines
   col  = mix(col, F3(1.0), 1.0 - smoothstep(0.0, 0.01, abs(d)));
 
+  //-- LM: Visualize raycast from point `ro` in direction `rd`
+  {
+    F2 ro = F2(-1.6, 0.6);
+    F2 rd = normalize(F2(1.0, -0.35));
+
+    F1 t = 0.0;
+    for (int i = 0; i < 24; ++i) {
+      F2 pos = ro + rd * t;
+      F1 d = fScene2d(pos);
+
+      F1 ring = fRing(uv, pos, abs(d));
+      col = mix(col, F3(1.0, 0.9, 0.3), 1.0 - smoothstep(0.0, 0.004, ring));
+
+      if (d < 0.001) break;
+      t += d;
+      if (t > 6.0) break;
+    }
+
+    F1 ray = fSegment(uv, ro, ro + rd * min(t, 6.0));
+    col = mix(col, F3(1.0), 1.0 - smoothstep(0.0, 0.003, ray));
+  }
+
   imageStore(out_image, p, F4(col, 1.0));
 }
 
@@ -197,9 +236,7 @@ void k_sdf_3d()
 //       compiled shader. This pattern will allow one shader to do everything.
 void main()
 {
-  if (K == 0) { k_clear(); }
-  else if (K == 1) { k_sdf_2d(); }
-  else if (K == 2) { k_sdf_3d(); }
+  COMPUTE_KERNELS(KERNEL_DISPATCH);
 }
 
 #endif /* GPU_ */
@@ -417,6 +454,8 @@ S_ A_(64) usize ramM[sizeof(RamT)/8];
 #define VK_PROC_LOAD(name, load) load,
 #define VK_CALL(name) ((PFN_vk##name)ramR->vk[VK_##name])
 
+#define COMPUTE_KERNEL_ENUM(id, fn) ComputeKernel_##fn = id,
+#define COMPUTE_KERNEL_NAME(id, fn) #fn
 //-- Limits
 #define SURFACE_PRESENT_SLOT_COUNT 2
 
@@ -737,7 +776,6 @@ struct ClientEvent {
   f32 delta[2];
   f32 pos[2];
 };
-
 
 //-- Per-Platform Types -- Implemented in platform-specific sections.
 typedef struct Client Client;
@@ -2271,6 +2309,16 @@ S_ u8 vk_proc_load[VK_PROC_COUNT] = {
   VK_PROCS(VK_PROC_LOAD)
 };
 
+typedef u32 ComputeKernelId;
+enum ComputeKernelId {
+  COMPUTE_KERNELS(COMPUTE_KERNEL_ENUM)
+  ComputeKernel_Count
+};
+
+S_ u8 *R_ compute_kernel_name[ComputeKernel_Count] = {
+  COMPUTE_KERNELS(COMPUTE_KERNEL_NAME)
+};
+
 I_ void find_vk_mem_type(VkPhysicalDeviceMemoryProperties *R_ mem_props,
                          VkMemoryRequirements *R_ req,
                          u32 flags, u32 *R_ out);
@@ -2658,7 +2706,7 @@ VkDevice         vkd;
 VkShaderModule          shmod;
 VkDescriptorSetLayout   dsl;
 VkPipelineLayout        ppl_layout;
-VkPipeline              ppl_clear;
+VkPipeline              ppl[ComputeKernel_Count];
 VkDescriptorPool        dsp;
 VkCommandPool           cmdpool;
 
@@ -3220,25 +3268,31 @@ main(void)
       };
       VK_CALL(CreatePipelineLayout)(ramR->vkd, &plci, 0, &ramR->ppl_layout);
 
-      u32 k = 1;
+      u32 k[ComputeKernel_Count];
+      VkComputePipelineCreateInfo cpci[ComputeKernel_Count];
+      VkSpecializationInfo spec[ComputeKernel_Count];
       VkSpecializationMapEntry spec_map = { .constantID = 0, .offset = 0, .size = 4 };
-      VkSpecializationInfo spec = {
-        .mapEntryCount = 1, .pMapEntries = &spec_map,
-        .dataSize = 4, .pData = &k,
-      };
-      VkComputePipelineCreateInfo cpci = {
-        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = {
-          .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-          .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-          .module = ramR->shmod,
-          .pName = "main",
-          .pSpecializationInfo = &spec,
-        },
-        .layout = ramR->ppl_layout,
-        .basePipelineIndex = -1,
-      };
-      if (VK_CALL(CreateComputePipelines)(ramR->vkd, 0, 1, &cpci, 0, &ramR->ppl_clear) != VK_SUCCESS)
+      for (u32 i=0; i<ComputeKernel_Count; ++i) {
+        k[i] = i;
+        spec[i] = (VkSpecializationInfo){
+          .mapEntryCount = 1, .pMapEntries = &spec_map,
+          .dataSize = 4, .pData = &k[i],
+        };
+        cpci[i] = (VkComputePipelineCreateInfo){
+          .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+          .stage = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+            .module = ramR->shmod,
+            .pName = "main",
+            .pSpecializationInfo = &spec[i],
+          },
+          .layout = ramR->ppl_layout,
+          .basePipelineIndex = -1,
+        };
+      }
+      if (VK_CALL(CreateComputePipelines)(ramR->vkd, 0, ComputeKernel_Count,
+                                          cpci, 0, ramR->ppl) != VK_SUCCESS)
       { printf("CreateComputePipelines failed\n"); goto exit; }
 
       /* one view + one descriptor set per slot */
@@ -3330,56 +3384,29 @@ main(void)
         };
         VK_CALL(BeginCommandBuffer)(ramR->present_cmd[i], &cbbi);
 
-        /* Frame-start: discard previous contents. UNDEFINED + IGNORED queue
-           families means we neither preserve data nor need an acquire from
-           FOREIGN -- the dispatch writes every pixel. */
-        VkImageMemoryBarrier to_general = {
-          .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-          .srcAccessMask = 0,
-          .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-          .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-          .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-          .image = ramR->present_img[i],
-          .subresourceRange = full,
-        };
-        VK_CALL(CmdPipelineBarrier)(ramR->present_cmd[i],
-          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-          0, 0, 0, 0, 0, 1, &to_general);
+        //-- LM: Based on what I've seen from Timothy Lottes (via his
+        //       neokineogfx youtube channel), I *should* be able to get away
+        //       with treating queue submit as implicit cache flush and not
+        //       need any barrier/transition on images with general layout.
+        //       This being the case, I've removed image layout transition
+        //       barriers from cmd buffer recording. I know this won't make the
+        //       validator happy, but this shouldn't be an actual problem in
+        //       practice. If it does prove problematic, adding barriers back
+        //       in won't be any trouble.
 
         VK_CALL(CmdBindPipeline)(ramR->present_cmd[i],
-          VK_PIPELINE_BIND_POINT_COMPUTE, ramR->ppl_clear);
+          VK_PIPELINE_BIND_POINT_COMPUTE, ramR->ppl[ComputeKernel_k_sdf_3d]);
         VK_CALL(CmdBindDescriptorSets)(ramR->present_cmd[i],
           VK_PIPELINE_BIND_POINT_COMPUTE, ramR->ppl_layout,
           0, 1, &ramR->present_dset[i], 0, 0);
         VK_CALL(CmdDispatch)(ramR->present_cmd[i],
           (RENDER_WIDTH + 15) / 16, (RENDER_HEIGHT + 15) / 16, 1);
 
-        /* Frame-end: release to the compositor. GENERAL -> GENERAL, so no
-           layout transition -- only the ownership handoff. */
-        VkImageMemoryBarrier to_foreign = {
-          .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-          .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-          .dstAccessMask = 0,
-          .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-          .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-          .srcQueueFamilyIndex = ramR->vk_qfam,
-          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT,
-          .image = ramR->present_img[i],
-          .subresourceRange = full,
-        };
-        VK_CALL(CmdPipelineBarrier)(ramR->present_cmd[i],
-          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-          VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-          0, 0, 0, 0, 0, 1, &to_foreign);
-
         VK_CALL(EndCommandBuffer)(ramR->present_cmd[i]);
 
         VkFenceCreateInfo fci = {
           .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-          .flags = VK_FENCE_CREATE_SIGNALED_BIT,   /* first wait passes */
+          .flags = VK_FENCE_CREATE_SIGNALED_BIT,
         };
         VK_CALL(CreateFence)(ramR->vkd, &fci, 0, &ramR->present_fence[i]);
       }
