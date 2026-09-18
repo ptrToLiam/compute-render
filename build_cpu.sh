@@ -32,8 +32,11 @@ if [ -v show_cmd ]; then
 fi
 
 if [ -v loop ]; then
-  echo "build looping not implemented yet"
-  exit 1
+  while : ; do
+    inotifywait -e close_write ./$name.c &>/dev/null
+    $CC $defines $flags ./$name.c -o $out &&
+      echo "$name: ok" && if [ -v run ]; then $out; fi || continue
+  done
 else
   $CC $defines $flags ./$name.c -o $out &&
     if [ -v run ]; then $out; fi
