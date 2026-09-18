@@ -404,6 +404,7 @@ S_ A_(64) usize ramM[sizeof(RamT)/8];
   X(DeviceWaitIdle,                    VKLOAD_DEVICE) \
   X(CreateCommandPool,                 VKLOAD_DEVICE) \
   X(DestroyCommandPool,                VKLOAD_DEVICE) \
+  X(ResetCommandPool,                  VKLOAD_DEVICE) \
   X(AllocateCommandBuffers,            VKLOAD_DEVICE) \
   X(FreeCommandBuffers,                VKLOAD_DEVICE) \
   X(BeginCommandBuffer,                VKLOAD_DEVICE) \
@@ -455,8 +456,10 @@ S_ A_(64) usize ramM[sizeof(RamT)/8];
 #define VK_CALL(name) ((PFN_vk##name)ramR->vk[VK_##name])
 
 #define COMPUTE_KERNEL_ENUM(id, fn) ComputeKernel_##fn = id,
-#define COMPUTE_KERNEL_NAME(id, fn) #fn
+#define COMPUTE_KERNEL_NAME(id, fn) #fn,
+
 //-- Limits
+#define SHADER_PATH "bin/quick.spv"
 #define SURFACE_PRESENT_SLOT_COUNT 2
 
 #endif /* CPU_ && DEF_ */
@@ -550,6 +553,10 @@ S_ A_(64) usize ramM[sizeof(RamT)/8];
 #include <drm/drm_fourcc.h>
 #include <time.h>
 #include <unistd.h>
+
+#if DEV_
+#include <sys/stat.h>
+#endif
 
 #endif /* CPU_ && DEF_ && LNX_ */
 
@@ -650,6 +657,20 @@ struct PresentBufferSpec {
   u32 offset;
   u64 modifier;
   PresentFormat format;
+};
+
+struct PresentCaps {
+  u32 drm_format;
+  u32 width, height;
+  u32 modifier_count;
+  u64 modifier[WL_FORMAT_MODIFIER_MAX];
+};
+
+struct PresentBuffer {
+  i32 fd;
+  u32 offset;
+  u32 stride;
+  u64 modifier;
 };
 
 typedef u32 MouseButton;
@@ -784,12 +805,26 @@ typedef struct PresentCaps PresentCaps;
 typedef struct PresentBuffer PresentBuffer;
 typedef struct SurfacePresentSlot SurfacePresentSlot;
 
-S_ u32 Gpu_InitDevice(PresentCaps *R_ caps,
-                      PresentBuffer *R_ bufs,
-                      u32 buf_count);
+//-- LM: Temp initial GPU use API -- To be replaced later with some minimal API
+//       that will allow full description of data ahead of time, not requiring
+//       so many individual calls for separate purposes.
+S_ u32  Gpu_InitInstance(void);
+S_ u32  Gpu_InitDevice(PresentCaps *R_ caps,
+                       PresentBuffer *R_ bufs,
+                       u32 buf_count);
+S_ u32  Gpu_LoadShader(void);
+S_ void Gpu_RecordCommands(void);
+S_ void Gpu_Dispatch(u32 slot);
+
+#if DEV_
+S_ void Gpu_PollShaderReload(void);
+#endif
+
+S_ void Surface_QueryPresentCaps(Surface *R_ surface,
+                                 PresentCaps *R_ out);
+
 S_ void Gpu_Mark(void);
 S_ void Gpu_Unmark(void);
-S_ void Gpu_Dispatch(u32 slot);
 
 S_ u32 Client_Connect(Client *R_ client);
 S_ u32 Client_Init(Client *R_ client);
@@ -1966,6 +2001,11 @@ typedef void (*PFN_vkDestroyCommandPool)(
     VkCommandPool commandPool,
     VkAllocationCallbacks *R_ pAllocator);
 
+typedef VkResult (*PFN_vkResetCommandPool)(
+    VkDevice device,
+    VkCommandPool commandPool,
+    VkFlags flags);
+
 typedef VkResult (*PFN_vkAllocateCommandBuffers)(
     VkDevice device,
     VkCommandBufferAllocateInfo *R_ pAllocateInfo,
@@ -2322,7 +2362,9 @@ S_ u8 *R_ compute_kernel_name[ComputeKernel_Count] = {
 I_ void find_vk_mem_type(VkPhysicalDeviceMemoryProperties *R_ mem_props,
                          VkMemoryRequirements *R_ req,
                          u32 flags, u32 *R_ out);
-S_ u32 Gpu_FilterModifiers(void);
+I_ u32 load_vk_procs(u64 gipa_handle);
+S_ u32 Gpu_FilterModifiers(u64 *R_ mods,
+                           u32 count);
 I_ PresentFormat PresentFormat_FromVkFormat(VkFormat vk_format);
 I_ VkFormat PresentFormat_ToVkFormat(PresentFormat format);
 
@@ -2716,6 +2758,9 @@ u32      vk_qfam;
 //-- Vk Images / Buffers / Memory
 u32  spirv[64 * 1024 / 4];
 u32  spirv_words;
+#if DEV_
+u64 shader_mtime;
+#endif
 VkImage         present_img   [SURFACE_PRESENT_SLOT_COUNT];
 VkDeviceMemory  present_mem   [SURFACE_PRESENT_SLOT_COUNT];
 VkImageView     present_view  [SURFACE_PRESENT_SLOT_COUNT];
@@ -2911,39 +2956,448 @@ find_vk_mem_type(VkPhysicalDeviceMemoryProperties *R_ mem_props,
 
 S_
 u32
-wl_filter_modifiers_for_driver(void)
+Gpu_InitInstance(void)
 {
-  VkDrmFormatModifierPropertiesEXT mp[WL_FORMAT_MODIFIER_MAX] = {0};
-  VkDrmFormatModifierPropertiesListEXT ml = {
-    .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
-    .drmFormatModifierCount = WL_FORMAT_MODIFIER_MAX,
-    .pDrmFormatModifierProperties = mp,
-  };
-  VkFormatProperties2 fp = {
-    .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
-    .pNext = &ml,
-  };
-  VK_CALL(GetPhysicalDeviceFormatProperties2)(ramR->vkpd,
-                                              VK_FORMAT_R8G8B8A8_UNORM, &fp);
-
-  VkFormatFeatureFlags need = VK_FORMAT_FEATURE_TRANSFER_DST_BIT
-                            | VK_FORMAT_FEATURE_BLIT_DST_BIT;
-  u32 keep = 0;
-  for (u32 i = 0; i < ramR->wl_format_modifier_count; ++i)
-  {
-    for (u32 j = 0; j < ml.drmFormatModifierCount; ++j)
-    {
-      if (mp[j].drmFormatModifier != ramR->wl_format_modifiers[i]) continue;
-      if (mp[j].drmFormatModifierPlaneCount != 1) break;
-      if ((mp[j].drmFormatModifierTilingFeatures & need) != need) break;
-      ramR->wl_format_modifiers[keep++] = ramR->wl_format_modifiers[i];
-      break;
-    }
+  LibHandle libvk = Lib(Str8Lit("libvulkan.so.1"));
+  if (E_(!(libvk.v), 0)) {
+    printf("Error: Could not open libvulkan. Cannot proceed\n");
+    return 1;
   }
-  ramR->wl_format_modifier_count = keep;
-  printf("Modifiers: %u usable\n", keep);
-  return keep;
+  SymHandle gipa = Sym(libvk, Str8Lit("vkGetInstanceProcAddr"));
+  if (E_(!(gipa.v), 0)) {
+    printf("Error: Failed to locate vkGetInstanceProcAddr. Cannot proceed\n");
+    return 1;
+  }
+  return load_vk_procs(gipa.v);
 }
+
+S_
+u32
+Gpu_InitDevice(PresentCaps *R_ caps,
+               PresentBuffer *R_ bufs,
+               u32 buf_count)
+{
+  if (buf_count > SURFACE_PRESENT_SLOT_COUNT)
+    buf_count = SURFACE_PRESENT_SLOT_COUNT;
+
+  //-- Physical device + compute queue family
+  {
+    u32 pd_count = 0;
+    VK_CALL(EnumeratePhysicalDevices)(ramR->vki, &pd_count, 0);
+    if (!pd_count) { printf("No physical devices\n"); return 1; }
+    VkPhysicalDevice pds[8] = {0};
+    if (pd_count > 8) pd_count = 8;
+    VK_CALL(EnumeratePhysicalDevices)(ramR->vki, &pd_count, pds);
+
+    ramR->vk_qfam = 0xffffffffu;
+    for (u32 i = 0; i < pd_count && ramR->vk_qfam == 0xffffffffu; ++i) {
+      u32 qn = 0;
+      VK_CALL(GetPhysicalDeviceQueueFamilyProperties)(pds[i], &qn, 0);
+      VkQueueFamilyProperties qfp[16] = {0};
+      if (qn > 16) qn = 16;
+      VK_CALL(GetPhysicalDeviceQueueFamilyProperties)(pds[i], &qn, qfp);
+      for (u32 q = 0; q < qn; ++q) {
+        if (qfp[q].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+          ramR->vkpd = pds[i];
+          ramR->vk_qfam = q;
+          break;
+        }
+      }
+    }
+    if (ramR->vk_qfam == 0xffffffffu) { printf("No compute queue\n"); return 1; }
+  }
+
+  //-- Logical device + device-level procs
+  {
+    f32 prio = 1.0f;
+    VkDeviceQueueCreateInfo qci = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+      .queueFamilyIndex = ramR->vk_qfam,
+      .queueCount = 1,
+      .pQueuePriorities = &prio,
+    };
+    i8 *R_ dext[] = {
+      "VK_KHR_external_memory",
+      "VK_KHR_external_memory_fd",
+      "VK_EXT_external_memory_dma_buf",
+      "VK_EXT_image_drm_format_modifier",
+      "VK_EXT_queue_family_foreign",
+    };
+    VkDeviceCreateInfo dci = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+      .queueCreateInfoCount = 1,
+      .pQueueCreateInfos = &qci,
+      .enabledExtensionCount = u32_(sizeof(dext)/sizeof(dext[0])),
+      .ppEnabledExtensionNames = dext,
+    };
+    if (VK_CALL(CreateDevice)(ramR->vkpd, &dci, 0, &ramR->vkd) != VK_SUCCESS)
+    { printf("vkCreateDevice failed\n"); return 1; }
+
+    PFN_vkGetDeviceProcAddr gdpa =
+      (PFN_vkGetDeviceProcAddr)ramR->vk[VK_GetDeviceProcAddr];
+    for (u32 i = 0; i < VK_PROC_COUNT; ++i) {
+      if (vk_proc_load[i] == VKLOAD_DEVICE)
+        ramR->vk[i] = (usize)gdpa(ramR->vkd, vk_proc_name[i]);
+    }
+    if (!ramR->vk[VK_GetImageDrmFormatModifierPropertiesEXT])
+    { printf("vkGetImageDrmFormatModifierPropertiesEXT missing\n"); return 1; }
+    if (!ramR->vk[VK_GetMemoryFdKHR])
+    { printf("vkGetMemoryFdKHR missing\n"); return 1; }
+
+    VK_CALL(GetDeviceQueue)(ramR->vkd, ramR->vk_qfam, 0, &ramR->vkq);
+  }
+
+  VkPhysicalDeviceMemoryProperties mem_props = {0};
+  VK_CALL(GetPhysicalDeviceMemoryProperties)(ramR->vkpd, &mem_props);
+
+  caps->modifier_count = Gpu_FilterModifiers(caps->modifier,
+                                             caps->modifier_count);
+  if (caps->modifier_count == 0)
+  { printf("No usable single-plane storage modifiers\n"); return 1; }
+
+  VkExtent3D extent = { caps->width, caps->height, 1 };
+
+  //-- Present slots: storage image + dma-buf export
+  for (u32 i = 0; i < buf_count; ++i)
+  {
+    VkImageDrmFormatModifierListCreateInfoEXT mod_list = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+      .drmFormatModifierCount = caps->modifier_count,
+      .pDrmFormatModifiers = caps->modifier,
+    };
+    VkExternalMemoryImageCreateInfo ext_img = {
+      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+      .pNext = &mod_list,
+      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
+    VkImageCreateInfo ici = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .pNext = &ext_img,
+      .imageType = VK_IMAGE_TYPE_2D,
+      .format = VK_FORMAT_R8G8B8A8_UNORM,
+      .extent = extent,
+      .mipLevels = 1,
+      .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+      .usage = VK_IMAGE_USAGE_STORAGE_BIT,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    if (VK_CALL(CreateImage)(ramR->vkd, &ici, 0, &ramR->present_img[i])
+        != VK_SUCCESS)
+    { printf("present CreateImage %u failed\n", i); return 1; }
+
+    VkMemoryRequirements req = {0};
+    VK_CALL(GetImageMemoryRequirements)(ramR->vkd, ramR->present_img[i], &req);
+    u32 mt = u32_(0xffffffff);
+    find_vk_mem_type(&mem_props, &req,
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &mt);
+    if (mt == u32_(0xffffffff)) { printf("present memtype %u\n", i); return 1; }
+
+    VkMemoryDedicatedAllocateInfo dedicated = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+      .image = ramR->present_img[i],
+    };
+    VkExportMemoryAllocateInfo exp = {
+      .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+      .pNext = &dedicated,
+      .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
+    VkMemoryAllocateInfo mai = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = &exp,
+      .allocationSize = req.size,
+      .memoryTypeIndex = mt,
+    };
+    if (VK_CALL(AllocateMemory)(ramR->vkd, &mai, 0, &ramR->present_mem[i])
+        != VK_SUCCESS)
+    { printf("present AllocateMemory %u failed\n", i); return 1; }
+    VK_CALL(BindImageMemory)(ramR->vkd, ramR->present_img[i],
+                             ramR->present_mem[i], 0);
+
+    VkImageDrmFormatModifierPropertiesEXT chosen = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT,
+    };
+    if (VK_CALL(GetImageDrmFormatModifierPropertiesEXT)
+          (ramR->vkd, ramR->present_img[i], &chosen) != VK_SUCCESS)
+    { printf("GetImageDrmFormatModifierProperties %u failed\n", i); return 1; }
+    ramR->present_mod[i] = chosen.drmFormatModifier;
+
+    VkImageSubresource sub = {
+      .aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT
+    };
+    VkSubresourceLayout layout = {0};
+    VK_CALL(GetImageSubresourceLayout)(ramR->vkd, ramR->present_img[i],
+                                       &sub, &layout);
+    ramR->present_offset[i] = u32_(layout.offset);
+    ramR->present_stride[i] = u32_(layout.rowPitch);
+
+    VkMemoryGetFdInfoKHR fdinfo = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
+      .memory = ramR->present_mem[i],
+      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
+    ramR->present_fd[i] = -1;
+    if (VK_CALL(GetMemoryFdKHR)(ramR->vkd, &fdinfo, &ramR->present_fd[i])
+        != VK_SUCCESS)
+    { printf("GetMemoryFdKHR %u failed\n", i); return 1; }
+
+    bufs[i].fd       = ramR->present_fd[i];
+    bufs[i].offset   = ramR->present_offset[i];
+    bufs[i].stride   = ramR->present_stride[i];
+    bufs[i].modifier = ramR->present_mod[i];
+
+    printf("present[%u] mod=0x%016llx fd=%d off=%u stride=%u\n",
+           i, (u64)ramR->present_mod[i], ramR->present_fd[i],
+           ramR->present_offset[i], ramR->present_stride[i]);
+  }
+
+  //-- Descriptor layout + pipeline layout (shader-independent)
+  {
+    VkDescriptorSetLayoutBinding bind = {
+      .binding = 0,
+      .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+      .descriptorCount = 1,
+      .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+    };
+    VkDescriptorSetLayoutCreateInfo dslci = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+      .bindingCount = 1,
+      .pBindings = &bind,
+    };
+    VK_CALL(CreateDescriptorSetLayout)(ramR->vkd, &dslci, 0, &ramR->dsl);
+
+    VkPipelineLayoutCreateInfo plci = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+      .setLayoutCount = 1,
+      .pSetLayouts = &ramR->dsl,
+    };
+    VK_CALL(CreatePipelineLayout)(ramR->vkd, &plci, 0, &ramR->ppl_layout);
+  }
+
+  //-- Views + descriptor sets, one per slot
+  {
+    VkDescriptorPoolSize poolsz = {
+      .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+      .descriptorCount = SURFACE_PRESENT_SLOT_COUNT,
+    };
+    VkDescriptorPoolCreateInfo dpci = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+      .maxSets = SURFACE_PRESENT_SLOT_COUNT,
+      .poolSizeCount = 1,
+      .pPoolSizes = &poolsz,
+    };
+    VK_CALL(CreateDescriptorPool)(ramR->vkd, &dpci, 0, &ramR->dsp);
+
+    VkDescriptorSetLayout set_layouts[SURFACE_PRESENT_SLOT_COUNT];
+    for (u32 i = 0; i < SURFACE_PRESENT_SLOT_COUNT; ++i)
+      set_layouts[i] = ramR->dsl;
+
+    VkDescriptorSetAllocateInfo dsai = {
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+      .descriptorPool = ramR->dsp,
+      .descriptorSetCount = SURFACE_PRESENT_SLOT_COUNT,
+      .pSetLayouts = set_layouts,
+    };
+    VK_CALL(AllocateDescriptorSets)(ramR->vkd, &dsai, ramR->present_dset);
+
+    VkDescriptorImageInfo dii[SURFACE_PRESENT_SLOT_COUNT] = {0};
+    VkWriteDescriptorSet  wr [SURFACE_PRESENT_SLOT_COUNT] = {0};
+    for (u32 i = 0; i < SURFACE_PRESENT_SLOT_COUNT; ++i) {
+      VkImageViewCreateInfo ivci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = ramR->present_img[i],
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .subresourceRange = {
+          .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+          .levelCount = 1,
+          .layerCount = 1,
+        },
+      };
+      VK_CALL(CreateImageView)(ramR->vkd, &ivci, 0, &ramR->present_view[i]);
+
+      dii[i] = (VkDescriptorImageInfo){
+        .imageView = ramR->present_view[i],
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+      };
+      wr[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = ramR->present_dset[i],
+        .dstBinding = 0,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .pImageInfo = &dii[i],
+      };
+    }
+    VK_CALL(UpdateDescriptorSets)(ramR->vkd,
+                                  SURFACE_PRESENT_SLOT_COUNT, wr, 0, 0);
+  }
+
+  //-- Command pool, buffers, fences
+  {
+    VkCommandPoolCreateInfo cpoci = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+      .queueFamilyIndex = ramR->vk_qfam,
+    };
+    if (VK_CALL(CreateCommandPool)(ramR->vkd, &cpoci, 0, &ramR->cmdpool)
+        != VK_SUCCESS)
+    { printf("CreateCommandPool failed\n"); return 1; }
+
+    VkCommandBufferAllocateInfo cbai = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+      .commandPool = ramR->cmdpool,
+      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+      .commandBufferCount = SURFACE_PRESENT_SLOT_COUNT,
+    };
+    VK_CALL(AllocateCommandBuffers)(ramR->vkd, &cbai, ramR->present_cmd);
+    if (!ramR->present_cmd[0])
+    { printf("AllocateCommandBuffers failed\n"); return 1; }
+
+    VkFenceCreateInfo fci = {
+      .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+      .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+    };
+    for (u32 i = 0; i < SURFACE_PRESENT_SLOT_COUNT; ++i)
+      VK_CALL(CreateFence)(ramR->vkd, &fci, 0, &ramR->present_fence[i]);
+  }
+
+  return 0;
+}
+
+S_
+u32
+Gpu_LoadShader(void)
+{
+  i32 sfd = open(SHADER_PATH, O_RDONLY);
+  if (sfd < 0) { printf("open %s failed\n", SHADER_PATH); return 1; }
+  isize n = read(sfd, ramR->spirv, sizeof(ramR->spirv));
+  close(sfd);
+  if (n < 20 || (n & 3))
+  { printf("bad spirv size %lld\n", (i64)n); return 1; }
+
+  //-- LM: spir-v magic number check
+  if (ramR->spirv[0] != 0x07230203u) { printf("not spir-v\n"); return 1; }
+  ramR->spirv_words = u32_(n) / 4;
+
+  VkShaderModule new_mod = 0;
+  VkPipeline     new_ppl[ComputeKernel_Count] = {0};
+
+  VkShaderModuleCreateInfo smci = {
+    .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+    .codeSize = (usize)n,
+    .pCode = ramR->spirv,
+  };
+  if (VK_CALL(CreateShaderModule)(ramR->vkd, &smci, 0, &new_mod) != VK_SUCCESS)
+  { printf("CreateShaderModule failed\n"); return 1; }
+
+  u32 k[ComputeKernel_Count];
+  VkSpecializationInfo spec[ComputeKernel_Count];
+  VkComputePipelineCreateInfo cpci[ComputeKernel_Count];
+  VkSpecializationMapEntry spec_map = {
+    .constantID = 0, .offset = 0, .size = sizeof(u32)
+  };
+  for (u32 i = 0; i < ComputeKernel_Count; ++i) {
+    k[i] = i;
+    spec[i] = (VkSpecializationInfo){
+      .mapEntryCount = 1, .pMapEntries = &spec_map,
+      .dataSize = sizeof(u32), .pData = &k[i],
+    };
+    cpci[i] = (VkComputePipelineCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+      .stage = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+        .module = new_mod,
+        .pName = "main",
+        .pSpecializationInfo = &spec[i],
+      },
+      .layout = ramR->ppl_layout,
+      .basePipelineIndex = -1,
+    };
+  }
+
+  if (VK_CALL(CreateComputePipelines)(ramR->vkd, 0, ComputeKernel_Count,
+                                      cpci, 0, new_ppl) != VK_SUCCESS)
+  {
+    printf("CreateComputePipelines failed\n");
+    VK_CALL(DestroyShaderModule)(ramR->vkd, new_mod, 0);
+    return 1;
+  }
+
+  //-- Success: retire the old set, replace with new.
+  if (ramR->shmod)
+  {
+    VK_CALL(DeviceWaitIdle)(ramR->vkd);
+    for (u32 i = 0; i < ComputeKernel_Count; ++i)
+      if (ramR->ppl[i]) VK_CALL(DestroyPipeline)(ramR->vkd, ramR->ppl[i], 0);
+    VK_CALL(DestroyShaderModule)(ramR->vkd, ramR->shmod, 0);
+  }
+  ramR->shmod = new_mod;
+  for (u32 i = 0; i < ComputeKernel_Count; ++i) ramR->ppl[i] = new_ppl[i];
+  return 0;
+}
+
+S_
+void
+Gpu_RecordCommands(void)
+{
+  VK_CALL(DeviceWaitIdle)(ramR->vkd);
+  VK_CALL(ResetCommandPool)(ramR->vkd, ramR->cmdpool, 0);
+
+  for (u32 i = 0; i < SURFACE_PRESENT_SLOT_COUNT; ++i)
+  {
+    /* NOT ONE_TIME_SUBMIT: recorded once, resubmitted every frame. */
+    VkCommandBufferBeginInfo cbbi = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = 0,
+    };
+    VK_CALL(BeginCommandBuffer)(ramR->present_cmd[i], &cbbi);
+
+    //-- LM: Based on what I've seen from Timothy Lottes (via his
+    //       neokineogfx youtube channel), I *should* be able to get away with
+    //       treating queue submit as implicit cache flush and not need any
+    //       barrier/transition on images with general layout.
+    //       This being the case, I've removed image layout transition barriers
+    //       from cmd buffer recording. I know this won't make the validator
+    //       happy, but this shouldn't be an actual problem in practice. If it
+    //       does prove problematic, adding barriers back in won't be any
+    //       trouble.
+
+    VK_CALL(CmdBindPipeline)(ramR->present_cmd[i],
+      VK_PIPELINE_BIND_POINT_COMPUTE, ramR->ppl[ComputeKernel_k_sdf_2d]);
+    VK_CALL(CmdBindDescriptorSets)(ramR->present_cmd[i],
+      VK_PIPELINE_BIND_POINT_COMPUTE, ramR->ppl_layout,
+      0, 1, &ramR->present_dset[i], 0, 0);
+    VK_CALL(CmdDispatch)(ramR->present_cmd[i],
+      (RENDER_WIDTH + 15) / 16, (RENDER_HEIGHT + 15) / 16, 1);
+
+    VK_CALL(EndCommandBuffer)(ramR->present_cmd[i]);
+  }
+}
+
+#if DEV_
+S_
+void
+Gpu_PollShaderReload(void)
+{
+  struct stat st;
+  if (stat(SHADER_PATH, &st) != 0) return;
+
+  u64 mtime = u64_(st.st_mtim.tv_sec) * u64_(1000000000)
+            + u64_(st.st_mtim.tv_nsec);
+  if (mtime == ramR->shader_mtime) return;
+  ramR->shader_mtime = mtime;
+
+  if (Gpu_LoadShader() == 0) {
+    Gpu_RecordCommands();
+    printf("[reload] %s\n", SHADER_PATH);
+  } else {
+    printf("[reload] failed, keeping previous shader\n");
+  }
+}
+#endif
 
 I_
 PresentFormat
@@ -3038,20 +3492,8 @@ main(void)
   struct timespec start, end;
   clock_gettime(CLOCK_MONOTONIC, &start);
 
-  //-- Initialize Vulkan Instance
-  LibHandle libvk = Lib(Str8Lit("libvulkan.so.1"));
-  if (E_(!(libvk.v), 0)) {
-    printf("Error: Could not open libvulkan. Cannot proceed\n");
-    goto exit;
-  }
-  SymHandle vkGetInstanceProcAddr = Sym(libvk, Str8Lit("vkGetInstanceProcAddr"));
-  if (E_(!(vkGetInstanceProcAddr.v), 0)) {
-    printf("Error: Failed to locate vkGetInstanceProcAddr. Cannot proceed\n");
-    goto exit;
-  }
-
-  load_vk_procs(vkGetInstanceProcAddr.v);
-
+  // Vulkan Instance Init Failure = Cannot Proceed
+  if (Gpu_InitInstance())            { goto exit; }
   // Client Connection Failure = Cannot Proceed
   if (Client_Connect(&ramR->client)) { goto exit; };
   // Client Init Failure = Cannot Proceed
@@ -3061,359 +3503,18 @@ main(void)
   Surface_Init(&ramR->client, &surface, PresentFormat_RGBA32_UNORM);
   Surface_SetTitle(&surface, Str8Lit("LmDev-GpuGame"));
 
-  //-- Prepare VK Context & Images
+  PresentCaps caps = {0};
+  PresentBuffer bufs[SURFACE_PRESENT_SLOT_COUNT] = {0};
+  Surface_QueryPresentCaps(&surface, &caps);
+  // Vulkan Device Init Failure = Cannot Proceed
+  if (Gpu_InitDevice(&caps, bufs, SURFACE_PRESENT_SLOT_COUNT)) { goto exit; }
+  // Vulkan Shader Load Failure = Cannot Proceed
+  if (Gpu_LoadShader()) { goto exit; }
+
+  Gpu_RecordCommands();
+
+  for (u16 i=0; i<SURFACE_PRESENT_SLOT_COUNT; ++i)
   {
-    u32 pd_count = 0;
-    VK_CALL(EnumeratePhysicalDevices)(ramR->vki, &pd_count, 0);
-    if (!pd_count) { printf("No physical devices\n"); goto exit; }
-    VkPhysicalDevice pds[8] = {0};
-    if (pd_count > 8) pd_count = 8;
-    VK_CALL(EnumeratePhysicalDevices)(ramR->vki, &pd_count, pds);
-
-    ramR->vk_qfam = 0xffffffffu;
-    for (u32 i = 0; i < pd_count && ramR->vk_qfam == 0xffffffffu; ++i) {
-      u32 qn = 0;
-      VK_CALL(GetPhysicalDeviceQueueFamilyProperties)(pds[i], &qn, 0);
-      VkQueueFamilyProperties qfp[16] = {0};
-      if (qn > 16) qn = 16;
-      VK_CALL(GetPhysicalDeviceQueueFamilyProperties)(pds[i], &qn, qfp);
-      for (u32 q = 0; q < qn; ++q) {
-        if (qfp[q].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-          ramR->vkpd = pds[i];
-          ramR->vk_qfam = q;
-          break;
-        }
-      }
-    }
-    if (ramR->vk_qfam == 0xffffffffu) {
-      printf("No compute queue\n"); goto exit;
-    }
-
-    f32 prio = 1.0f;
-    VkDeviceQueueCreateInfo qci = {
-      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-      .queueFamilyIndex = ramR->vk_qfam,
-      .queueCount = 1,
-      .pQueuePriorities = &prio,
-    };
-
-    //-- LM: List of all required device extensions:
-    i8 *R_ dext[] = {
-      "VK_KHR_external_memory",
-      "VK_KHR_external_memory_fd",
-      "VK_EXT_external_memory_dma_buf",
-      "VK_EXT_image_drm_format_modifier",
-      "VK_EXT_queue_family_foreign",
-    };
-    VkDeviceCreateInfo dci = {
-      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-      .queueCreateInfoCount = 1,
-      .pQueueCreateInfos = &qci,
-      .enabledExtensionCount = u32_(sizeof(dext)/sizeof(dext[0])),
-      .ppEnabledExtensionNames = dext,
-    };
-    if (VK_CALL(CreateDevice)(ramR->vkpd, &dci, 0, &ramR->vkd) != VK_SUCCESS) {
-      printf("vkCreateDevice failed (try dropping VK_KHR_external_memory if 1.1+)\n");
-      goto exit;
-    }
-
-    PFN_vkGetDeviceProcAddr gdpa =
-      (PFN_vkGetDeviceProcAddr)ramR->vk[VK_GetDeviceProcAddr];
-    for (u32 i = 0; i < VK_PROC_COUNT; ++i) {
-      if (vk_proc_load[i] == VKLOAD_DEVICE)
-        ramR->vk[i] = (usize)gdpa(ramR->vkd, vk_proc_name[i]);
-    }
-    if (!ramR->vk[VK_GetImageDrmFormatModifierPropertiesEXT]) {
-      printf("vkGetImageDrmFormatModifierPropertiesEXT missing\n"); goto exit;
-    }
-    if (!ramR->vk[VK_GetMemoryFdKHR]) {
-      printf("vkGetMemoryFdKHR missing\n"); goto exit;
-    }
-    VK_CALL(GetDeviceQueue)(ramR->vkd, ramR->vk_qfam, 0, &ramR->vkq);
-
-    VkPhysicalDeviceMemoryProperties mem_props = {0};
-    VK_CALL(GetPhysicalDeviceMemoryProperties)(ramR->vkpd, &mem_props);
-
-    VkExtent3D extent = { RENDER_WIDTH, RENDER_HEIGHT, 1 };
-
-    if (Gpu_FilterModifiers() == 0) {
-      printf("No usable single-plane storage modifiers\n"); goto exit;
-    }
-
-    /* ---- present slots: storage image + dma-buf export ---- */
-    for (u32 i = 0; i < SURFACE_PRESENT_SLOT_COUNT; ++i) {
-      VkImageDrmFormatModifierListCreateInfoEXT mod_list = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
-        .drmFormatModifierCount = ramR->wl_format_modifier_count,
-        .pDrmFormatModifiers = ramR->wl_format_modifiers,
-      };
-      VkExternalMemoryImageCreateInfo ext_img = {
-        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
-        .pNext = &mod_list,
-        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-      };
-      VkImageCreateInfo ici = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .pNext = &ext_img,
-        .imageType = VK_IMAGE_TYPE_2D,
-        .format = VK_FORMAT_R8G8B8A8_UNORM,
-        .extent = extent,
-        .mipLevels = 1,
-        .arrayLayers = 1,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
-        .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-        .usage = VK_IMAGE_USAGE_STORAGE_BIT,      /* compute writes directly */
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-      };
-      if (VK_CALL(CreateImage)(ramR->vkd, &ici, 0, &ramR->present_img[i])
-          != VK_SUCCESS)
-      { printf("present CreateImage %u failed\n", i); goto exit; }
-
-      VkMemoryRequirements req = {0};
-      VK_CALL(GetImageMemoryRequirements)(ramR->vkd, ramR->present_img[i], &req);
-      u32 mt = u32_(0xffffffff);
-      find_vk_mem_type(&mem_props, &req,
-                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &mt);
-      if (mt == u32_(0xffffffff)) { printf("present memtype %u\n", i); goto exit; }
-
-      VkMemoryDedicatedAllocateInfo dedicated = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-        .image = ramR->present_img[i],
-      };
-      VkExportMemoryAllocateInfo exp = {
-        .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
-        .pNext = &dedicated,
-        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-      };
-      VkMemoryAllocateInfo mai = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .pNext = &exp,
-        .allocationSize = req.size,
-        .memoryTypeIndex = mt,
-      };
-      if (VK_CALL(AllocateMemory)(ramR->vkd, &mai, 0, &ramR->present_mem[i])
-          != VK_SUCCESS)
-      { printf("present AllocateMemory %u failed\n", i); goto exit; }
-      VK_CALL(BindImageMemory)(ramR->vkd, ramR->present_img[i],
-                               ramR->present_mem[i], 0);
-
-      VkImageDrmFormatModifierPropertiesEXT chosen = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT,
-      };
-      if (VK_CALL(GetImageDrmFormatModifierPropertiesEXT)
-            (ramR->vkd, ramR->present_img[i], &chosen) != VK_SUCCESS)
-      { printf("GetImageDrmFormatModifierProperties %u failed\n", i); goto exit; }
-      ramR->present_mod[i] = chosen.drmFormatModifier;
-
-      VkImageSubresource sub = {
-        .aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT
-      };
-      VkSubresourceLayout layout = {0};
-      VK_CALL(GetImageSubresourceLayout)(ramR->vkd, ramR->present_img[i],
-                                         &sub, &layout);
-      ramR->present_offset[i] = u32_(layout.offset);
-      ramR->present_stride[i] = u32_(layout.rowPitch);
-
-      VkMemoryGetFdInfoKHR fdinfo = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
-        .memory = ramR->present_mem[i],
-        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-      };
-      ramR->present_fd[i] = -1;
-      if (VK_CALL(GetMemoryFdKHR)(ramR->vkd, &fdinfo, &ramR->present_fd[i])
-          != VK_SUCCESS)
-      { printf("GetMemoryFdKHR %u failed\n", i); goto exit; }
-
-      printf("present[%u] mod=0x%016llx fd=%d off=%u stride=%u\n",
-             i, (u64)ramR->present_mod[i], ramR->present_fd[i],
-             ramR->present_offset[i], ramR->present_stride[i]);
-    }
-
-    //-- Prepare compute pipeline for render
-    {
-      i32 sfd = open("bin/quick.spv", O_RDONLY);
-      if (sfd < 0) { printf("open quick.spv failed\n"); goto exit; }
-      isize n = read(sfd, ramR->spirv, sizeof(ramR->spirv));
-      close(sfd);
-      if (n < 20 || (n & 3)) { printf("bad spirv size %lld\n", (i64)n); goto exit; }
-      ramR->spirv_words = (u32)n / 4;
-      if (ramR->spirv[0] != 0x07230203u) { printf("not spir-v\n"); goto exit; }
-
-      VkShaderModuleCreateInfo smci = {
-        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = (usize)n,
-        .pCode = ramR->spirv,
-      };
-      if (VK_CALL(CreateShaderModule)(ramR->vkd, &smci, 0, &ramR->shmod) != VK_SUCCESS)
-      { printf("CreateShaderModule failed\n"); goto exit; }
-
-      VkDescriptorSetLayoutBinding bind = {
-        .binding = 0,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-        .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-      };
-      VkDescriptorSetLayoutCreateInfo dslci = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 1,
-        .pBindings = &bind,
-      };
-      VK_CALL(CreateDescriptorSetLayout)(ramR->vkd, &dslci, 0, &ramR->dsl);
-
-      VkPipelineLayoutCreateInfo plci = {
-        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .setLayoutCount = 1,
-        .pSetLayouts = &ramR->dsl,
-      };
-      VK_CALL(CreatePipelineLayout)(ramR->vkd, &plci, 0, &ramR->ppl_layout);
-
-      u32 k[ComputeKernel_Count];
-      VkComputePipelineCreateInfo cpci[ComputeKernel_Count];
-      VkSpecializationInfo spec[ComputeKernel_Count];
-      VkSpecializationMapEntry spec_map = { .constantID = 0, .offset = 0, .size = 4 };
-      for (u32 i=0; i<ComputeKernel_Count; ++i) {
-        k[i] = i;
-        spec[i] = (VkSpecializationInfo){
-          .mapEntryCount = 1, .pMapEntries = &spec_map,
-          .dataSize = 4, .pData = &k[i],
-        };
-        cpci[i] = (VkComputePipelineCreateInfo){
-          .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-          .stage = {
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-            .module = ramR->shmod,
-            .pName = "main",
-            .pSpecializationInfo = &spec[i],
-          },
-          .layout = ramR->ppl_layout,
-          .basePipelineIndex = -1,
-        };
-      }
-      if (VK_CALL(CreateComputePipelines)(ramR->vkd, 0, ComputeKernel_Count,
-                                          cpci, 0, ramR->ppl) != VK_SUCCESS)
-      { printf("CreateComputePipelines failed\n"); goto exit; }
-
-      /* one view + one descriptor set per slot */
-      VkDescriptorPoolSize poolsz = {
-        .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-        .descriptorCount = SURFACE_PRESENT_SLOT_COUNT,
-      };
-      VkDescriptorPoolCreateInfo dpci = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = SURFACE_PRESENT_SLOT_COUNT,
-        .poolSizeCount = 1,
-        .pPoolSizes = &poolsz,
-      };
-      VK_CALL(CreateDescriptorPool)(ramR->vkd, &dpci, 0, &ramR->dsp);
-
-      VkDescriptorSetLayout set_layouts[SURFACE_PRESENT_SLOT_COUNT];
-      for (u32 i = 0; i < SURFACE_PRESENT_SLOT_COUNT; ++i) set_layouts[i] = ramR->dsl;
-
-      VkDescriptorSetAllocateInfo dsai = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .descriptorPool = ramR->dsp,
-        .descriptorSetCount = SURFACE_PRESENT_SLOT_COUNT,
-        .pSetLayouts = set_layouts,
-      };
-      VK_CALL(AllocateDescriptorSets)(ramR->vkd, &dsai, ramR->present_dset);
-
-      VkDescriptorImageInfo   dii[SURFACE_PRESENT_SLOT_COUNT] = {0};
-      VkWriteDescriptorSet    wr [SURFACE_PRESENT_SLOT_COUNT] = {0};
-      for (u32 i = 0; i < SURFACE_PRESENT_SLOT_COUNT; ++i) {
-        VkImageViewCreateInfo ivci = {
-          .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-          .image = ramR->present_img[i],
-          .viewType = VK_IMAGE_VIEW_TYPE_2D,
-          .format = VK_FORMAT_R8G8B8A8_UNORM,
-          .subresourceRange = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .levelCount = 1,
-            .layerCount = 1,
-          },
-        };
-        VK_CALL(CreateImageView)(ramR->vkd, &ivci, 0, &ramR->present_view[i]);
-
-        dii[i] = (VkDescriptorImageInfo){
-          .imageView = ramR->present_view[i],
-          .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-        };
-        wr[i] = (VkWriteDescriptorSet){
-          .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-          .dstSet = ramR->present_dset[i],
-          .dstBinding = 0,
-          .descriptorCount = 1,
-          .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-          .pImageInfo = &dii[i],
-        };
-      }
-      VK_CALL(UpdateDescriptorSets)(ramR->vkd,
-                                    SURFACE_PRESENT_SLOT_COUNT, wr, 0, 0);
-
-      VkCommandPoolCreateInfo cpoci = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-        .queueFamilyIndex = ramR->vk_qfam,
-      };
-
-      if (VK_CALL(CreateCommandPool)(ramR->vkd, &cpoci, 0, &ramR->cmdpool)
-          != VK_SUCCESS)
-      { printf("CreateCommandPool failed\n"); goto exit; }
-
-      VkCommandBufferAllocateInfo cbai = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool = ramR->cmdpool,
-        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = SURFACE_PRESENT_SLOT_COUNT,
-      };
-      VK_CALL(AllocateCommandBuffers)(ramR->vkd, &cbai, ramR->present_cmd);
-      if (!ramR->present_cmd[0]) { printf("AllocateCommandBuffers failed\n"); goto exit; }
-
-      VkImageSubresourceRange full = {
-        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-        .levelCount = 1,
-        .layerCount = 1,
-      };
-
-      for (u32 i = 0; i < SURFACE_PRESENT_SLOT_COUNT; ++i)
-      {
-        /* NOT ONE_TIME_SUBMIT: these are recorded once and resubmitted. */
-        VkCommandBufferBeginInfo cbbi = {
-          .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-          .flags = 0,
-        };
-        VK_CALL(BeginCommandBuffer)(ramR->present_cmd[i], &cbbi);
-
-        //-- LM: Based on what I've seen from Timothy Lottes (via his
-        //       neokineogfx youtube channel), I *should* be able to get away
-        //       with treating queue submit as implicit cache flush and not
-        //       need any barrier/transition on images with general layout.
-        //       This being the case, I've removed image layout transition
-        //       barriers from cmd buffer recording. I know this won't make the
-        //       validator happy, but this shouldn't be an actual problem in
-        //       practice. If it does prove problematic, adding barriers back
-        //       in won't be any trouble.
-
-        VK_CALL(CmdBindPipeline)(ramR->present_cmd[i],
-          VK_PIPELINE_BIND_POINT_COMPUTE, ramR->ppl[ComputeKernel_k_sdf_3d]);
-        VK_CALL(CmdBindDescriptorSets)(ramR->present_cmd[i],
-          VK_PIPELINE_BIND_POINT_COMPUTE, ramR->ppl_layout,
-          0, 1, &ramR->present_dset[i], 0, 0);
-        VK_CALL(CmdDispatch)(ramR->present_cmd[i],
-          (RENDER_WIDTH + 15) / 16, (RENDER_HEIGHT + 15) / 16, 1);
-
-        VK_CALL(EndCommandBuffer)(ramR->present_cmd[i]);
-
-        VkFenceCreateInfo fci = {
-          .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-          .flags = VK_FENCE_CREATE_SIGNALED_BIT,
-        };
-        VK_CALL(CreateFence)(ramR->vkd, &fci, 0, &ramR->present_fence[i]);
-      }
-    }
-  }
-
-  for (u16 i=0; i<SURFACE_PRESENT_SLOT_COUNT; ++i) {
     Surface_CreateBuffer(&surface, i, &(PresentBufferSpec){
       .fd = ramR->present_fd[i],
       .width = RENDER_WIDTH, .height = RENDER_HEIGHT,
@@ -3434,6 +3535,11 @@ main(void)
   u32 first_present = 1;
 
   for (;;) {
+
+    #if DEV_
+    Gpu_PollShaderReload();
+    #endif
+
     ClientEvent events[8] = {0};
     Client_PollEvents(&ramR->client, events, 8);
     for (u32 idx=0; idx<8; ++idx)
@@ -3486,6 +3592,12 @@ main(void)
 
 exit:
 #ifdef CLEANUP
+  //-- LM: This isn't really important for program functionality, but would be
+  //       rather important to have implemented in the case of attempting to
+  //       use static analysis tools like Valgrind on the program without
+  //       hitting a load of unimportant noise.
+
+  // TODO: add in full GPU-side mem freeing etc.
   if (ramR->vki) { VK_CALL(DestroyInstance)(ramR->vki, 0); }
   Client_Shutdown(&ramR->client);
 #endif
@@ -4558,6 +4670,18 @@ Surface_Init(Client *R_ client,
   printf("SurfaceInit Complete!\n");
 }
 
+void
+Surface_QueryPresentCaps(Surface *R_ surface,
+                         PresentCaps *R_ out)
+{
+  out->drm_format = PresentFormat_ToDrmFormat(surface->present_format);
+  out->width  = RENDER_WIDTH;
+  out->height = RENDER_HEIGHT;
+  out->modifier_count = ramR->wl_format_modifier_count;
+  for (u32 i = 0; i < ramR->wl_format_modifier_count; ++i)
+    out->modifier[i] = ramR->wl_format_modifiers[i];
+}
+
 S_
 void
 Surface_SetTitle(Surface *R_ surface,
@@ -4691,7 +4815,7 @@ Surface_Present(Surface *R_ surface,
 
 S_
 u32
-Gpu_FilterModifiers(void)
+Gpu_FilterModifiers(u64 *R_ mods, u32 count)
 {
   VkDrmFormatModifierPropertiesEXT mp[WL_FORMAT_MODIFIER_MAX] = {0};
   VkDrmFormatModifierPropertiesListEXT ml = {
@@ -4706,24 +4830,20 @@ Gpu_FilterModifiers(void)
   VK_CALL(GetPhysicalDeviceFormatProperties2)(ramR->vkpd,
                                               VK_FORMAT_R8G8B8A8_UNORM, &fp);
 
-  u32 offered = ramR->wl_format_modifier_count;
   u32 keep = 0;
-  for (u32 i = 0; i < offered; ++i)
-  {
-    for (u32 j = 0; j < ml.drmFormatModifierCount; ++j)
-    {
-      if (mp[j].drmFormatModifier != ramR->wl_format_modifiers[i]) continue;
-      /* Single plane only. This is the "no compression swap chain" request:
-         multi-plane modifiers carry CCS metadata we do not transmit. */
+  for (u32 i = 0; i < count; ++i) {
+    for (u32 j = 0; j < ml.drmFormatModifierCount; ++j) {
+      if (mp[j].drmFormatModifier != mods[i]) continue;
+      /* Single plane only: multi-plane modifiers carry CCS metadata planes
+         that we do not transmit. This is the no-compression request. */
       if (mp[j].drmFormatModifierPlaneCount != 1) break;
       if (!(mp[j].drmFormatModifierTilingFeatures
             & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) break;
-      ramR->wl_format_modifiers[keep++] = ramR->wl_format_modifiers[i];
+      mods[keep++] = mods[i];
       break;
     }
   }
-  ramR->wl_format_modifier_count = keep;
-  printf("Modifiers: %u usable of %u offered\n", keep, offered);
+  printf("Modifiers: %u usable of %u offered\n", keep, count);
   return keep;
 }
 
