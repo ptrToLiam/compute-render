@@ -3273,6 +3273,10 @@ Gpu_LoadShader(void)
   i32 sfd = open(SHADER_PATH, O_RDONLY);
   if (sfd < 0) { printf("open %s failed\n", SHADER_PATH); return 1; }
   isize n = read(sfd, ramR->spirv, sizeof(ramR->spirv));
+  if (n == (isize)sizeof(ramR->spirv)) {
+    printf("spirv too large for buffer (%zu)\n", sizeof(ramR->spirv));
+    return 1;
+  }
   close(sfd);
   if (n < 20 || (n & 3))
   { printf("bad spirv size %lld\n", (i64)n); return 1; }
@@ -3385,17 +3389,15 @@ Gpu_PollShaderReload(void)
   struct stat st;
   if (stat(SHADER_PATH, &st) != 0) return;
 
-  u64 mtime = u64_(st.st_mtim.tv_sec) * u64_(1000000000)
+  u64 mtime = u64_(st.st_mtim.tv_sec) * u64_(NS_PER_S)
             + u64_(st.st_mtim.tv_nsec);
   if (mtime == ramR->shader_mtime) return;
   ramR->shader_mtime = mtime;
 
-  if (Gpu_LoadShader() == 0) {
+  if (E_(Gpu_LoadShader() == 0, 1)) {
     Gpu_RecordCommands();
-    printf("[reload] %s\n", SHADER_PATH);
-  } else {
-    printf("[reload] failed, keeping previous shader\n");
-  }
+    printf("[Reload] %s\n", SHADER_PATH);
+  } else { printf("[Reload] failed, keeping previous shader\n"); }
 }
 #endif
 

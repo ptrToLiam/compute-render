@@ -1,0 +1,17 @@
+# Fast path for the hot-reload loop.
+# Structural cleanup only: gives the driver clean SSA to work with,
+# without the expensive loop and redundancy passes.
+--strip-debug
+--eliminate-dead-branches
+--merge-return
+--inline-entry-points-exhaustive
+--eliminate-dead-functions
+--private-to-local
+--scalar-replacement=100
+--convert-local-access-chains
+--eliminate-local-single-block
+--eliminate-local-single-store
+--ssa-rewrite
+--ccp
+--simplify-instructions
+--eliminate-dead-code-aggressive

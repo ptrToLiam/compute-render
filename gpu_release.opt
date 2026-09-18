@@ -1,0 +1,27 @@
+# Release Optimizations.
+--strip-debug
+--strip-nonsemantic
+--eliminate-dead-branches
+--merge-return
+--inline-entry-points-exhaustive
+--eliminate-dead-functions
+--private-to-local
+--scalar-replacement=100
+--convert-local-access-chains
+--eliminate-local-single-block
+--eliminate-local-single-store
+--eliminate-dead-code-aggressive
+--ssa-rewrite
+--ccp
+--loop-unroll
+--eliminate-dead-branches
+--redundancy-elimination
+--combine-access-chains
+--simplify-instructions
+--vector-dce
+--eliminate-dead-inserts
+--if-conversion
+--copy-propagate-arrays
+--reduce-load-size
+--merge-blocks
+--eliminate-dead-code-aggressive

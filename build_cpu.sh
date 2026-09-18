@@ -15,10 +15,10 @@ else
   exit 1
 fi
 
-if ! [ -v release ]; then defines="-DDEV_=1" && opt="-O0 -g";
+if ! [ -v release ]; then defines="$defines -DDEV_=1" && opt="-O0 -g";
 else defines="$defines" && opt="-O3"; fi;
 
-if [ -v lnx ]; then defines="$defines -DCPU_=1 -DLNX_=1"; fi
+if [ -v lnx ]; then defines="$defines -DLNX_=1"; fi
 if [ -v cleanup ]; then defines="$defines -DCLEANUP=1"; fi
 
 warn_flags="-Wno-cpp"
