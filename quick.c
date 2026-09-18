@@ -25,36 +25,93 @@
 
 #if (GPU_||(CPU_&&DEF_))
 
-#define RENDER_WIDTH  1920
-#define RENDER_HEIGHT 1080
+#define RENDER_WIDTH  (1920 / 2)
+#define RENDER_HEIGHT (1080 / 2)
 
 #endif /* APU DEF_ */
 
 #if GPU_
 
-#define i32 int
 #define F1 float
 #define F2 vec2
 #define F3 vec3
 #define F4 vec4
 
+#define I1 uint
 #define I2 uvec2
 #define I3 uvec3
 #define I4 uvec4
-#define SI2 ivec2
-#define SI3 ivec3
-#define SI4 ivec4
+#define S1 int
+#define S2 ivec2
+#define S3 ivec3
+#define S4 ivec4
 
-layout(constant_id = 0) const i32 K = 0;
-layout(constant_id = 1) const i32 W = RENDER_WIDTH;
-layout(constant_id = 2) const i32 H = RENDER_HEIGHT;
+layout(constant_id = 0) const I1 K = 0;
+layout(constant_id = 1) const I1 W = RENDER_WIDTH;
+layout(constant_id = 2) const I1 H = RENDER_HEIGHT;
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(set = 0, binding = 0, rgba8) uniform writeonly image2D out_image;
 
-i32 kMaxIter = 128;
-i32 mandelbrot(inout F2 z) {
+
+//-----------------------------------------------------------------------------
+// Analytic SDF Function Definitions
+//-----------------------------------------------------------------------------
+
+struct Sphere {
+  F3 pos;
+  F1 rad;
+};
+
+struct Box {
+  F3 pos;
+  F3 size;
+};
+
+F1 fCircle(F2 p, F1 r)
+{
+  return length(p) - r;
+}
+
+F1 fSphere(F3 p, F3 c, F1 r) {
+  return length(p - c) - r;
+}
+
+F1 fBox(F3 p, F3 c, F3 size) {
+  F3 q = abs(p - c) - size;
+  return length(max(q, 0.0)) + min(max(q.x, max(q.y,q.z)), 0.0);
+}
+
+I1 marchMaxSteps = 128;
+F1 fScene(F3 p) {
+  Sphere sphere = { F3(0), 1.0 };
+  Box    box    = { F3(-0.2), F3(0.4) };
+
+  F1 fd = max(p.y + 0.5, length(p.xz) - 8.0);
+  F1 d = min(fBox(p, box.pos, box.size), fSphere(p, sphere.pos, sphere.rad));
+
+  return min(fd, d);
+}
+
+F1 fScene2d(F2 p) {
+  F1 r = 0.3;
+  F3 c = F3(0, 0.5, 0.0);
+
+  F1 lim = p.y+0.5;
+  F1 d = fSphere(F3(p, 0), c, r);
+
+  return min(d, lim);
+}
+
+//-----------------------------------------------------------------------------
+
+//-----------------------------------------------------------------------------
+// Fractal Function Definitions
+//-----------------------------------------------------------------------------
+
+const I1 kMaxIter = 128;
+I1 mandelbrot(inout F2 z) {
   const F2 c = z;
-  for (i32 i = 0; i < kMaxIter; i++) {
+  for (I1 i = 0; i < kMaxIter; i++) {
     if (dot(z,z) > 256) return i;
     z = F2(z.x * z.x - z.y * z.y, 2.0 * z.x * z.y) + c;
   }
@@ -62,7 +119,7 @@ i32 mandelbrot(inout F2 z) {
 }
 
 F3 mandelbrot_color(F2 uv) {
-  i32 i = mandelbrot(uv);
+  I1 i = mandelbrot(uv);
   F3 color = F3(0.0);
   if (i != kMaxIter) {
     color = 0.5 + 0.5 * sin(i + F3(0, 0.5, 1)
@@ -71,15 +128,21 @@ F3 mandelbrot_color(F2 uv) {
   return color;
 }
 
+//-----------------------------------------------------------------------------
+
+//-----------------------------------------------------------------------------
+// Compute Kernel Definitions
+//-----------------------------------------------------------------------------
+
 //-- LM: This is a quick initial screen clear compute shader. This will be
 //       replaced soon with proper rendering code.
 void k_clear()
 {
-  SI2 p = SI2(gl_GlobalInvocationID.xy);
-  SI2 s = SI2(W, H);
+  S2 p = S2(gl_GlobalInvocationID.xy);
+  S2 s = S2(W, H);
   if (p.x >= s.x || p.y >= s.y) return;
 
-  F1 ar = s.x / s.y;
+  F1 ar = F1(s.x) / F1(s.y);
   F2 nc = ((p / F2(s.x, s.y)) * 2) - 1;
   nc.y *= -1;
   nc.x *= ar;
@@ -89,10 +152,54 @@ void k_clear()
   imageStore(out_image, p, color);
 }
 
+//-- LM: Simple 2D SDF scene render for testing and confirmation of initial
+//       understanding of the relevant concepts.
+//       This may later become the standard kernel for e.g. text rendering.
+void k_sdf_2d()
+{
+  S2 p = S2(gl_GlobalInvocationID.xy);
+  if (p.x >= W || p.y >= H) return;
+
+  F2 uv = (F2(p)+0.5) / F2(F1(W), F1(H)); // 0..1, pixel centre
+  uv = uv * 2.0 - 1.0;                    // -1..1
+  uv.y = -uv.y;                           // y up
+  uv.x *= F1(W) / F1(H);                  // aspect, once
+
+  F1 d = fScene2d(uv);
+  F3 col = (d < 0.0) ? F3(0.65, 0.85, 1.0) : F3(0.90, 0.60, 0.30);
+
+  col *= 1.0 - exp(-6.0 * abs(d));   // fade with distance
+  col *= 0.8 + 0.2 * cos(140.0 * d); // isolines
+  col  = mix(col, F3(1.0), 1.0 - smoothstep(0.0, 0.01, abs(d)));
+
+  imageStore(out_image, p, F4(col, 1.0));
+}
+
+//-- LM: Proper 3D SDF scene rendering. This will be where the primary render
+//       logic will live.
+void k_sdf_3d()
+{
+  S2 p = S2(gl_GlobalInvocationID.xy);
+  if (p.x >= W || p.y >= H) return;
+
+  F2 uv = (F2(p)+0.5) / F2(F1(W), F1(H)); // 0..1, pixel centre
+  uv = uv * 2.0 - 1.0;                    // -1..1
+  uv.y = -uv.y;                           // y up
+  uv.x *= F1(W) / F1(H);                  // aspect, once
+
+  F3 col = F3(0.1, 0.3, 0.3);
+  imageStore(out_image, p, F4(col, 1.0));
+}
+
+//-----------------------------------------------------------------------------
+
 //-- LM: Specialization Constant for multiple compute kernels out of the same
 //       compiled shader. This pattern will allow one shader to do everything.
-void main() {
+void main()
+{
   if (K == 0) { k_clear(); }
+  else if (K == 1) { k_sdf_2d(); }
+  else if (K == 2) { k_sdf_3d(); }
 }
 
 #endif /* GPU_ */
@@ -2284,8 +2391,9 @@ enum WaylandRequest {
 
   //-- XDG Toplevel Requests
   WaylandRequest_XdgToplevelSetTitle = 2,
-  WaylandRequest_XdgToplevelSetMaxSize, // TODO: Add actual opcode
-  WaylandRequest_XdgToplevelSetMinSize, // TODO: Add actual opcode
+  WaylandRequest_XdgToplevelSetAppId = 3,
+  WaylandRequest_XdgToplevelSetMaxSize = 7,
+  WaylandRequest_XdgToplevelSetMinSize = 8,
 
   //-- Linux Dmabuf Requests
   WaylandRequest_DmabufDestroy = 0,
@@ -2903,7 +3011,7 @@ main(void)
 
   Surface surface = {0};
   Surface_Init(&ramR->client, &surface, PresentFormat_RGBA32_UNORM);
-  // Surface_SetTitle(&surface, Str8Lit("GpuGame"));
+  Surface_SetTitle(&surface, Str8Lit("LmDev-GpuGame"));
 
   //-- Prepare VK Context & Images
   {
@@ -3112,7 +3220,7 @@ main(void)
       };
       VK_CALL(CreatePipelineLayout)(ramR->vkd, &plci, 0, &ramR->ppl_layout);
 
-      u32 k = 0;
+      u32 k = 1;
       VkSpecializationMapEntry spec_map = { .constantID = 0, .offset = 0, .size = 4 };
       VkSpecializationInfo spec = {
         .mapEntryCount = 1, .pMapEntries = &spec_map,
@@ -4429,23 +4537,38 @@ Surface_SetTitle(Surface *R_ surface,
                  String8 title)
 {
   WaylandConnection *R_ connection = &surface->client->connection;
-  u32 title_plus_nul_length = title.len+1;
   u32 title_encode_length = Wayland_StringEncodeLength(title);
+  u32 title_plus_nul_len = title.len+1;
   u32 title_zero_count = title_encode_length - title.len;
 
-  WaylandWireHeader header = {
-    .id = u32_(surface->xdg_toplevel),
-    .op = WaylandRequest_XdgToplevelSetTitle,
-    .len = sizeof(WaylandWireHeader)
-           + sizeof(u32) + title_encode_length,
+  //-- LM: Currently setting both title and app_id to the same value as I'm
+  //       only using one surface anyway and I just want them both to match
+  //       my compositor's window class float rules.
+  WaylandWireHeader headers[] = {
+    {
+      .id = u32_(surface->xdg_toplevel),
+      .op = WaylandRequest_XdgToplevelSetTitle,
+      .len = sizeof(WaylandWireHeader)
+             + sizeof(u32) + title_encode_length,
+    },
+    {
+      .id = u32_(surface->xdg_toplevel),
+      .op = WaylandRequest_XdgToplevelSetAppId,
+      .len = sizeof(WaylandWireHeader)
+             + sizeof(u32) + title_encode_length,
+    },
   };
 
   u8 string_zeroes[4] = {0};
 
-  RingBuffer_PutBytes(&connection->out, &header, sizeof(WaylandWireHeader));
-  RingBuffer_PutBytes(&connection->out, &title_encode_length, sizeof(u32));
-  RingBuffer_PutBytes(&connection->out, title.ptr, title_plus_nul_length);
-  RingBuffer_PutBytes(&connection->out, string_zeroes, title_zero_count);
+  for (u32 idx=0; idx<2; ++idx)
+  {
+    RingBuffer_PutBytes(&connection->out, &headers[idx],
+                        sizeof(WaylandWireHeader));
+    RingBuffer_PutBytes(&connection->out, &title_plus_nul_len, sizeof(u32));
+    RingBuffer_PutBytes(&connection->out, title.ptr, title.len);
+    RingBuffer_PutBytes(&connection->out, string_zeroes, title_zero_count);
+  }
 }
 
 S_
